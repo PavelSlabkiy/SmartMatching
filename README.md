@@ -36,16 +36,35 @@
 2. Пары ниже `threshold` отбрасываются.
 3. Из оставшихся выбирается одна пара с максимальным `score`.
 
-## Быстрый тестовый запуск
+## Локальный запуск
 
-Скрипт для тестирования `run_match_test.py`:
+Точка входа — `main.py`:
 
 ```bash
-python3 run_match_test.py --tree1 ./import.json --tree2 ./import.json
+python3 main.py --tree1 ./import.json --tree2 ./import.json
 ```
 
 С порогом:
 
 ```bash
-python3 run_match_test.py --tree1 ./import.json --tree2 ./import.json --threshold 90
+python3 main.py --tree1 ./import.json --tree2 ./import.json --threshold 90
 ```
+
+## Docker
+
+Сборка образа:
+
+```bash
+docker build -t smartmatching:latest .
+```
+
+Запуск контейнера:
+
+```bash
+docker run --rm -v "$(pwd):/data" smartmatching:latest --tree1 /data/import.json --tree2 /data/import.json --threshold 90
+```
+
+Пояснение:
+- `ENTRYPOINT` контейнера: `["python", "main.py"]`;
+- аргументы после имени образа передаются в `main.py`;
+- через `-v "$(pwd):/data"` входные файлы из текущей директории доступны внутри контейнера по пути `/data`.

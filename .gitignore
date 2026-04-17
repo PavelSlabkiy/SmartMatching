@@ -20,3 +20,5 @@ env/
 
 # Other
 .cursor/
+import.json
+run_match_test.py
