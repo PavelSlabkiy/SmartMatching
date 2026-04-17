@@ -1,150 +1,267 @@
-from rapidfuzz import fuzz
 from datetime import date
 import json
-import heapq
-import sys
 import re
 
-class SmartMatching:
-    '''
-    SmartMatching — поиск похожих людей во всех деревьях.
-    Теперь возвращает список совпадений, и для каждого совпадения формируется отдельный people-фрагмент.
-    '''
-    def __init__(self, data, database, trashhold: int = 90, k: int = 1):
-        self.data = data
-        self.database = database
-        self.trashhold = trashhold
-        self.k = k
+from rapidfuzz import fuzz
 
-    # ----------------------------------------------------------------------
+
+class SmartMatching:
+    """
+    Алгоритм поиска лучшего совпадения персон между двумя генеалогическими древами.
+
+    Ожидаемый вход:
+    - два дерева в формате `import.json` (каждое дерево — JSON-массив персон);
+    - каждый элемент массива содержит поля `_id`, `treeId`, `name`, `surname`,
+      `middleName`, `maidenName`, `birthdate`, `birthplace` (часть полей может отсутствовать).
+
+    Выход:
+    - один лучший мэтч (dict), если его score >= threshold;
+    - пустой dict, если ни одна пара персон не прошла порог.
+    """
+
+    def __init__(self, tree1, tree2, threshold: int = 90):
+        """
+        Инициализирует сравнение двух деревьев.
+
+        :param tree1: первое дерево в формате import.json (str или list[dict]).
+        :param tree2: второе дерево в формате import.json (str или list[dict]).
+        :param threshold: минимальный score пары, чтобы считаться валидным мэтчем.
+        """
+        self.threshold = threshold
+        self.tree1 = self._parse_tree(tree1)
+        self.tree2 = self._parse_tree(tree2)
+
+    @staticmethod
+    def _normalize_text(value: str) -> str:
+        """Нормализует строку для fuzzy-сравнения."""
+        if not value:
+            return ""
+        value = value.lower()
+        value = re.sub(r"[^\w\s]", " ", value)
+        value = re.sub(r"\s+", " ", value).strip()
+        return value
+
+    @staticmethod
+    def _text_similarity(a: str, b: str) -> int:
+        """Считает текстовую похожесть двух полей в шкале 0..100."""
+        if not a or not b:
+            return 70
+        return fuzz.token_sort_ratio(
+            SmartMatching._normalize_text(a),
+            SmartMatching._normalize_text(b),
+        )
+
+    @staticmethod
+    def _extract_oid(value):
+        """Извлекает строковый id из Mongo-представления {'$oid': ...}."""
+        if isinstance(value, dict):
+            return value.get("$oid")
+        return value
+
+    @staticmethod
+    def _first_value(value):
+        """Берет первый элемент массива значений или возвращает само значение."""
+        if isinstance(value, list):
+            if not value:
+                return None
+            return value[0]
+        return value
+
+    @staticmethod
+    def _birthdate_to_string(raw_birthdate):
+        """
+        Приводит birthdate из import.json к строке формата:
+        YYYY, YYYY-MM или YYYY-MM-DD.
+        """
+        birth = SmartMatching._first_value(raw_birthdate)
+        if not isinstance(birth, dict):
+            return ""
+
+        year = birth.get("year")
+        month = birth.get("month")
+        day = birth.get("day")
+
+        if not year:
+            return ""
+        if not month:
+            return f"{year}"
+        if not day:
+            return f"{year}-{month:02d}"
+        return f"{year}-{month:02d}-{day:02d}"
+
+    @staticmethod
+    def _parse_date_range(value: str):
+        """Преобразует частичную дату в диапазон дат для мягкого сравнения."""
+        if not value:
+            return None
+        parts = value.split("-")
+        try:
+            year = int(parts[0])
+            if len(parts) == 1:
+                return date(year, 1, 1), date(year, 12, 31)
+            month = int(parts[1])
+            if len(parts) == 2:
+                return date(year, month, 1), date(year, month, 28)
+            day = int(parts[2])
+            return date(year, month, day), date(year, month, day)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _date_similarity(d1: str, d2: str) -> int:
+        """Считает похожесть дат рождения с учетом неполных дат."""
+        if not d1 or not d2:
+            return 50
+
+        r1 = SmartMatching._parse_date_range(d1)
+        r2 = SmartMatching._parse_date_range(d2)
+        if not r1 or not r2:
+            return 50
+
+        start1, end1 = r1
+        start2, end2 = r2
+
+        if start1 <= end2 and start2 <= end1:
+            return 100
+        if abs(start1.year - start2.year) <= 1:
+            return 70
+        return 0
+
+    @staticmethod
+    def _place_similarity(place1: str, place2: str) -> int:
+        """Сравнивает места рождения по токенам и триграммам."""
+        stop_words = {
+            "г",
+            "город",
+            "с",
+            "село",
+            "деревня",
+            "пос",
+            "поселок",
+            "рн",
+            "район",
+            "обл",
+            "область",
+            "край",
+            "республика",
+            "уезд",
+            "волость",
+        }
+
+        def normalize(text: str):
+            """Нормализация топонима: чистка и удаление служебных токенов."""
+            if not text:
+                return []
+            text = SmartMatching._normalize_text(text)
+            seen = set()
+            out = []
+            for token in text.split():
+                if len(token) <= 2 or token in stop_words:
+                    continue
+                if token not in seen:
+                    out.append(token)
+                    seen.add(token)
+            return out
+
+        def trigrams(text: str):
+            """Строит множество триграмм строки."""
+            text = f"  {text} "
+            return {text[i : i + 3] for i in range(len(text) - 2)}
+
+        def trigram_jaccard(a: str, b: str):
+            """Коэффициент Жаккара по триграммам."""
+            ta = trigrams(a)
+            tb = trigrams(b)
+            if not ta or not tb:
+                return 0.0
+            return len(ta & tb) / len(ta | tb)
+
+        tokens1 = normalize(place1)
+        tokens2 = normalize(place2)
+        if not tokens1 or not tokens2:
+            return 50
+
+        short_tokens, long_tokens = (
+            (tokens1, tokens2) if len(tokens1) <= len(tokens2) else (tokens2, tokens1)
+        )
+        long_text = " ".join(long_tokens)
+        scores = [trigram_jaccard(token, long_text) for token in short_tokens]
+        if not scores:
+            return 0
+
+        best = max(scores)
+        avg = sum(scores) / len(scores)
+        final = best * 0.7 + avg * 0.3
+        if final >= 0.75:
+            return 100
+        if final >= 0.55:
+            return 80
+        if final >= 0.35:
+            return 60
+        if final >= 0.2:
+            return 40
+        return 0
+
+    @staticmethod
+    def _person_to_index(person: dict) -> dict:
+        """Приводит запись персоны к плоскому индексу полей для сравнения."""
+        return {
+            "name": SmartMatching._first_value(person.get("name")) or "",
+            "middleName": SmartMatching._first_value(person.get("middleName")) or "",
+            "lastName": SmartMatching._first_value(person.get("surname")) or "",
+            "maidenName": SmartMatching._first_value(person.get("maidenName")) or "",
+            "birthDate": SmartMatching._birthdate_to_string(person.get("birthdate")),
+            "birthPlace": SmartMatching._first_value(person.get("birthplace")) or "",
+        }
+
+    @staticmethod
+    def _parse_tree(raw_tree):
+        """
+        Парсит одно дерево в формате import.json.
+
+        Поддерживаемый формат: JSON-массив персон (строка JSON или list[dict]).
+        Валидация:
+        - у каждой персоны должен быть `_id`;
+        - у каждой персоны должен быть `treeId`;
+        - все персоны должны принадлежать одному `treeId`.
+        """
+        if isinstance(raw_tree, str):
+            raw_tree = json.loads(raw_tree)
+
+        if not isinstance(raw_tree, list):
+            raise ValueError("Ожидается массив персон (формат import.json).")
+
+        people = {}
+        tree_id = None
+        for person in raw_tree:
+            person_id = SmartMatching._extract_oid(person.get("_id"))
+            if not person_id:
+                raise ValueError("У персоны отсутствует поле _id.")
+
+            person_tree_id = SmartMatching._extract_oid(person.get("treeId"))
+            if not person_tree_id:
+                raise ValueError(f"У персоны {person_id} отсутствует поле treeId.")
+
+            if tree_id is None:
+                tree_id = person_tree_id
+            elif tree_id != person_tree_id:
+                raise ValueError("Во входном массиве обнаружены персоны из разных деревьев.")
+
+            people[str(person_id)] = person
+
+        if tree_id is None:
+            raise ValueError("Пустое дерево: не найдено ни одной персоны.")
+
+        return {"id": tree_id, "people": people}
 
     def compare_idx2idx(self, idx1: dict, idx2: dict) -> float:
-        # ---------- helpers (local) ----------
+        """
+        Рассчитывает итоговый score совпадения двух персон.
 
-        def normalize_text(s: str) -> str:
-            if not s:
-                return ""
-            s = s.lower()
-            s = re.sub(r"[^\w\s]", "", s)
-            s = re.sub(r"\s+", " ", s).strip()
-            return s
-
-        def text_similarity(a: str, b: str) -> int:
-            if not a or not b:
-                return 70
-            return fuzz.token_sort_ratio(normalize_text(a), normalize_text(b))
-
-        def parse_date_range(d: str):
-            if not d:
-                return None
-            parts = d.split("-")
-            try:
-                year = int(parts[0])
-                if len(parts) == 1:
-                    return date(year, 1, 1), date(year, 12, 31)
-                month = int(parts[1])
-                if len(parts) == 2:
-                    return date(year, month, 1), date(year, month, 28)
-                day = int(parts[2])
-                return date(year, month, day), date(year, month, day)
-            except Exception:
-                return None
-
-        def date_similarity(d1: str, d2: str) -> int:
-            if not d1 or not d2:
-                return 50
-
-            r1 = parse_date_range(d1)
-            r2 = parse_date_range(d2)
-
-            if not r1 or not r2:
-                return 50
-
-            start1, end1 = r1
-            start2, end2 = r2
-
-            if start1 <= end2 and start2 <= end1:
-                return 100
-
-            if abs(start1.year - start2.year) <= 1:
-                return 70
-
-            return 0
-
-        # ---------- new birthPlace similarity ----------
-
-        def place_similarity(str1: str, str2: str) -> int:
-            STOP_WORDS = {
-                "г", "город", "с", "село", "деревня", "пос", "поселок",
-                "рн", "район", "обл", "область", "край",
-                "республика", "уезд", "волость"
-            }
-
-            def normalize(text: str) -> list[str]:
-                if not text:
-                    return []
-
-                text = text.lower()
-                text = re.sub(r"[^\w\s]", " ", text)
-                tokens = text.split()
-
-                seen = set()
-                result = []
-                for t in tokens:
-                    if len(t) <= 2 or t in STOP_WORDS:
-                        continue
-                    if t not in seen:
-                        seen.add(t)
-                        result.append(t)
-                return result
-
-            def trigrams(s: str) -> set[str]:
-                s = f"  {s} "
-                return {s[i:i + 3] for i in range(len(s) - 2)}
-
-            def trigram_jaccard(a: str, b: str) -> float:
-                ta = trigrams(a)
-                tb = trigrams(b)
-                if not ta or not tb:
-                    return 0.0
-                return len(ta & tb) / len(ta | tb)
-
-            tokens1 = normalize(str1)
-            tokens2 = normalize(str2)
-
-            if not tokens1 or not tokens2:
-                return 50
-
-            if len(tokens1) <= len(tokens2):
-                short_tokens, long_tokens = tokens1, tokens2
-            else:
-                short_tokens, long_tokens = tokens2, tokens1
-
-            long_text = " ".join(long_tokens)
-
-            scores = []
-            for token in short_tokens:
-                scores.append(trigram_jaccard(token, long_text))
-
-            if not scores:
-                return 0
-
-            best = max(scores)
-            avg = sum(scores) / len(scores)
-            final = best * 0.7 + avg * 0.3
-
-            if final >= 0.75:
-                return 100
-            if final >= 0.55:
-                return 80
-            if final >= 0.35:
-                return 60
-            if final >= 0.2:
-                return 40
-            return 0
-
-        # ---------- weighted scoring ----------
-
+        Важно:
+        - пол и статус жизни в скоринге не участвуют;
+        - девичья фамилия учитывается только если присутствует у обеих персон.
+        """
         score = 0.0
         weight_sum = 0.0
 
@@ -153,152 +270,59 @@ class SmartMatching:
             score += part_score * weight
             weight_sum += weight
 
-        # Фамилия
-        add(text_similarity(idx1.get("lastName"), idx2.get("lastName")), 0.25)
+        add(self._text_similarity(idx1.get("lastName"), idx2.get("lastName")), 0.28)
+        add(self._text_similarity(idx1.get("name"), idx2.get("name")), 0.24)
 
-        # Имя
-        add(text_similarity(idx1.get("name"), idx2.get("name")), 0.20)
-
-        # Отчество
         if idx1.get("middleName") or idx2.get("middleName"):
-            add(text_similarity(idx1.get("middleName"), idx2.get("middleName")), 0.10)
+            add(self._text_similarity(idx1.get("middleName"), idx2.get("middleName")), 0.10)
 
-        # Дата рождения
-        add(date_similarity(idx1.get("birthDate"), idx2.get("birthDate")), 0.25)
+        add(self._date_similarity(idx1.get("birthDate"), idx2.get("birthDate")), 0.28)
+        add(self._place_similarity(idx1.get("birthPlace"), idx2.get("birthPlace")), 0.10)
 
-        # Место рождения (улучшенное сравнение)
-        add(place_similarity(idx1.get("birthPlace"), idx2.get("birthPlace")), 0.10)
-
-        # Пол
-        if idx1.get("gender") and idx2.get("gender"):
-            add(100 if idx1["gender"] == idx2["gender"] else 0, 0.10)
-
-        # Статус жизни
-        if idx1.get("isAlive") is not None and idx2.get("isAlive") is not None:
-            add(100 if str(idx1["isAlive"]) == str(idx2["isAlive"]) else 0, 0.05)
+        # Девичья фамилия учитывается только при наличии в обеих записях.
+        if idx1.get("maidenName") and idx2.get("maidenName"):
+            add(self._text_similarity(idx1.get("maidenName"), idx2.get("maidenName")), 0.12)
 
         if weight_sum == 0:
             return 0.0
-
         return score / weight_sum
 
-    # ----------------------------------------------------------------------
-    def get_oldest_generation_idx(self):
-        data_json = json.loads(self.data)
-        oldest_idx = []
-        for person_id, person in data_json["people"].items():
-            if person.get("fatherId") is None and person.get("motherId") is None:
-                oldest_idx.append(person_id)
-        return oldest_idx
+    def get_best_match(self) -> dict:
+        """
+        Ищет лучшую пару персон между двумя деревьями.
 
-    # ----------------------------------------------------------------------
-    # Поиск совпадений во всех деревьях
-    # ----------------------------------------------------------------------
-    def parse_json(self):
-        data_json = json.loads(self.data)
-        database_json = json.loads(self.database)
-        oldest_idx = self.get_oldest_generation_idx()
+        :return: dict формата:
+            {
+              "score": float,
+              "tree1": {"id": str, "personId": str, "person": {...}},
+              "tree2": {"id": str, "personId": str, "person": {...}}
+            }
+            или {} если подходящих пар нет.
+        """
+        best = None
+        people1 = self.tree1["people"]
+        people2 = self.tree2["people"]
 
-        scores_dict = {}
+        for person1_id, person1 in people1.items():
+            idx1 = self._person_to_index(person1)
+            for person2_id, person2 in people2.items():
+                idx2 = self._person_to_index(person2)
+                score = self.compare_idx2idx(idx1, idx2)
+                if score < self.threshold:
+                    continue
+                if best is None or score > best["score"]:
+                    best = {
+                        "score": round(score, 2),
+                        "tree1": {
+                            "id": self.tree1["id"],
+                            "personId": person1_id,
+                            "person": person1,
+                        },
+                        "tree2": {
+                            "id": self.tree2["id"],
+                            "personId": person2_id,
+                            "person": person2,
+                        },
+                    }
 
-        for data_idx in oldest_idx:
-            scores_list = []
-
-            for tree_id, tree_data in database_json.get("tree_id", {}).items():
-                people = tree_data.get("people", {})
-
-                for db_id, db_person in people.items():
-
-                    score = self.compare_idx2idx(data_json["people"][data_idx], db_person)
-                    if score >= self.trashhold:
-                        scores_list.append({
-                            "data_id": data_idx,
-                            "tree_id": tree_id,
-                            "tree_owner": tree_data.get("tree_owner"),
-                            "database_id": db_id,
-                            "score": score
-                        })
-
-            scores_dict[data_idx] = scores_list
-
-        return scores_dict
-
-    # ----------------------------------------------------------------------
-    def top_k_idx(self):
-        k = self.k
-        scores_dict = self.parse_json()
-
-        pairs = [
-            entry
-            for _, entries in scores_dict.items()
-            for entry in entries
-        ]
-
-        top_k = heapq.nlargest(k, pairs, key=lambda x: x["score"])
-        return top_k
-
-    # ----------------------------------------------------------------------
-    # Формируем отдельный people-фрагмент для КАЖДОГО совпадения
-    # ----------------------------------------------------------------------
-    def get_older_generation_idx(self):
-        top = self.top_k_idx()
-        database_json = json.loads(self.database)
-
-        matchedDataIds = list({t["data_id"] for t in top})
-
-        results = []
-
-        for match in top:
-            tree_id = match["tree_id"]
-            db_person_id = match["database_id"]
-
-            people = database_json["tree_id"][tree_id]["people"]
-
-            # если по какой-то причине нет — пропускаем
-            if db_person_id not in people:
-                continue
-
-            # собираем предков именно для этого совпадения
-            fragment_people = {}
-
-            def collect_ancestors(pid):
-                if pid is None or pid not in people:
-                    return
-                if pid in fragment_people:
-                    return
-                person = people[pid]
-                fragment_people[pid] = person
-                collect_ancestors(person.get("fatherId"))
-                collect_ancestors(person.get("motherId"))
-
-            collect_ancestors(db_person_id)
-
-            # добавляем в общий список
-            results.append({
-                **match,
-                "people": fragment_people
-            })
-
-        return {
-            "matches": results,
-            "matchedDataIds": matchedDataIds
-        }
-
-
-# ------------------------------------------------------------------------------
-# CLI
-# ------------------------------------------------------------------------------
-if __name__ == "__main__":
-    payload = sys.stdin.read()
-    if not payload:
-        print(json.dumps({}))
-        sys.exit(0)
-
-    obj = json.loads(payload)
-    data = obj.get("data")
-    db = obj.get("db")
-
-    SM = SmartMatching(data, db, trashhold=90, k=5)
-    out = SM.get_older_generation_idx()
-
-    print(json.dumps(out))
+        return best or {}
