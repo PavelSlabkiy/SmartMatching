@@ -15,19 +15,20 @@ class SmartMatching:
       `middleName`, `maidenName`, `birthdate`, `birthplace` (часть полей может отсутствовать).
 
     Выход:
-    - один лучший мэтч (dict), если его score >= threshold;
-    - пустой dict, если ни одна пара персон не прошла порог.
+    - все мэтчи со score >= threshold (от лучшего к худшему) + метаданные.
     """
 
-    def __init__(self, tree1, tree2, threshold: int = 90):
+    def __init__(self, tree1, tree2, threshold: int = 90, exact_match: bool = True):
         """
         Инициализирует сравнение двух деревьев.
 
         :param tree1: первое дерево в формате import.json (str или list[dict]).
         :param tree2: второе дерево в формате import.json (str или list[dict]).
         :param threshold: минимальный score пары, чтобы считаться валидным мэтчем.
+        :param exact_match: режим строгого сравнения ключевых полей.
         """
         self.threshold = threshold
+        self.exact_match = exact_match
         self.tree1 = self._parse_tree(tree1)
         self.tree2 = self._parse_tree(tree2)
 
@@ -126,6 +127,53 @@ class SmartMatching:
         if abs(start1.year - start2.year) <= 1:
             return 70
         return 0
+
+    @staticmethod
+    def _date_parts(value: str):
+        """
+        Возвращает кортеж частей даты (year, month, day).
+
+        Для пустых/некорректных значений возвращает (None, None, None).
+        """
+        if not value:
+            return None, None, None
+        parts = value.split("-")
+        try:
+            year = int(parts[0]) if len(parts) >= 1 else None
+            month = int(parts[1]) if len(parts) >= 2 else None
+            day = int(parts[2]) if len(parts) >= 3 else None
+            return year, month, day
+        except Exception:
+            return None, None, None
+
+    @staticmethod
+    def _date_exact_match(d1: str, d2: str) -> bool:
+        """
+        Проверяет exact match дат по правилу минимальной точности.
+
+        Правила:
+        - сравнение возможно только если в обеих датах есть год;
+        - если хотя бы в одной дате задан только год, сравнивается только год;
+        - если хотя бы в одной дате задан год+месяц, сравниваются год и месяц;
+        - если обе даты полные, сравниваются год, месяц и день.
+        """
+        y1, m1, day1 = SmartMatching._date_parts(d1)
+        y2, m2, day2 = SmartMatching._date_parts(d2)
+
+        if not y1 or not y2:
+            return False
+        if y1 != y2:
+            return False
+
+        precision1 = 1 + int(m1 is not None) + int(day1 is not None)
+        precision2 = 1 + int(m2 is not None) + int(day2 is not None)
+        min_precision = min(precision1, precision2)
+
+        if min_precision >= 2 and m1 != m2:
+            return False
+        if min_precision >= 3 and day1 != day2:
+            return False
+        return True
 
     @staticmethod
     def _place_similarity(place1: str, place2: str) -> int:
@@ -254,6 +302,39 @@ class SmartMatching:
 
         return {"id": tree_id, "people": people}
 
+    def _is_exact_candidate(self, idx1: dict, idx2: dict) -> bool:
+        """
+        Проверяет, есть ли смысл сравнивать пару в exact-режиме.
+
+        Требования:
+        - фамилия, имя, отчество, дата и место рождения должны быть непустыми в обеих записях;
+        - фамилия, имя и отчество должны совпадать строго (с нормализацией);
+        - дата рождения должна совпадать по правилам exact-сравнения;
+        - девичья фамилия сравнивается строго только при наличии в обеих записях.
+        """
+        required_fields = ("lastName", "name", "middleName", "birthDate", "birthPlace")
+        for field in required_fields:
+            if not idx1.get(field) or not idx2.get(field):
+                return False
+
+        if self._normalize_text(idx1["lastName"]) != self._normalize_text(idx2["lastName"]):
+            return False
+        if self._normalize_text(idx1["name"]) != self._normalize_text(idx2["name"]):
+            return False
+        if self._normalize_text(idx1["middleName"]) != self._normalize_text(idx2["middleName"]):
+            return False
+
+        if not self._date_exact_match(idx1["birthDate"], idx2["birthDate"]):
+            return False
+
+        maiden1 = idx1.get("maidenName")
+        maiden2 = idx2.get("maidenName")
+        if maiden1 and maiden2:
+            if self._normalize_text(maiden1) != self._normalize_text(maiden2):
+                return False
+
+        return True
+
     def compare_idx2idx(self, idx1: dict, idx2: dict) -> float:
         """
         Рассчитывает итоговый score совпадения двух персон.
@@ -261,7 +342,11 @@ class SmartMatching:
         Важно:
         - пол и статус жизни в скоринге не участвуют;
         - девичья фамилия учитывается только если присутствует у обеих персон.
+        - в exact-режиме несовпавшие/пустые ключевые поля отсекают пару сразу.
         """
+        if self.exact_match and not self._is_exact_candidate(idx1, idx2):
+            return 0.0
+
         score = 0.0
         weight_sum = 0.0
 
@@ -270,36 +355,56 @@ class SmartMatching:
             score += part_score * weight
             weight_sum += weight
 
-        add(self._text_similarity(idx1.get("lastName"), idx2.get("lastName")), 0.28)
-        add(self._text_similarity(idx1.get("name"), idx2.get("name")), 0.24)
+        if self.exact_match:
+            add(100, 0.28)  # Фамилия уже прошла exact-match
+            add(100, 0.24)  # Имя уже прошло exact-match
+        else:
+            add(self._text_similarity(idx1.get("lastName"), idx2.get("lastName")), 0.28)
+            add(self._text_similarity(idx1.get("name"), idx2.get("name")), 0.24)
 
         if idx1.get("middleName") or idx2.get("middleName"):
-            add(self._text_similarity(idx1.get("middleName"), idx2.get("middleName")), 0.10)
+            if self.exact_match:
+                add(100, 0.10)  # Отчество уже прошло exact-match
+            else:
+                add(self._text_similarity(idx1.get("middleName"), idx2.get("middleName")), 0.10)
 
-        add(self._date_similarity(idx1.get("birthDate"), idx2.get("birthDate")), 0.28)
+        if self.exact_match:
+            add(100, 0.28)  # Дата уже прошла exact-match
+        else:
+            add(self._date_similarity(idx1.get("birthDate"), idx2.get("birthDate")), 0.28)
         add(self._place_similarity(idx1.get("birthPlace"), idx2.get("birthPlace")), 0.10)
 
         # Девичья фамилия учитывается только при наличии в обеих записях.
         if idx1.get("maidenName") and idx2.get("maidenName"):
-            add(self._text_similarity(idx1.get("maidenName"), idx2.get("maidenName")), 0.12)
+            if self.exact_match:
+                add(100, 0.12)  # Девичья фамилия уже прошла exact-match
+            else:
+                add(self._text_similarity(idx1.get("maidenName"), idx2.get("maidenName")), 0.12)
 
         if weight_sum == 0:
             return 0.0
         return score / weight_sum
 
-    def get_best_match(self) -> dict:
+    def get_matches(self) -> dict:
         """
-        Ищет лучшую пару персон между двумя деревьями.
+        Ищет все пары персон между двумя деревьями, прошедшие threshold.
 
         :return: dict формата:
             {
-              "score": float,
-              "tree1": {"id": str, "personId": str, "person": {...}},
-              "tree2": {"id": str, "personId": str, "person": {...}}
+              "tree1Size": int,
+              "tree2Size": int,
+              "matchesCount": int,
+              "matches": [
+                {
+                  "score": float,
+                  "tree1": {"id": str, "personId": str, "person": {...}},
+                  "tree2": {"id": str, "personId": str, "person": {...}}
+                },
+                ...
+              ]
             }
-            или {} если подходящих пар нет.
         """
-        best = None
+        matches = []
         people1 = self.tree1["people"]
         people2 = self.tree2["people"]
 
@@ -310,8 +415,8 @@ class SmartMatching:
                 score = self.compare_idx2idx(idx1, idx2)
                 if score < self.threshold:
                     continue
-                if best is None or score > best["score"]:
-                    best = {
+                matches.append(
+                    {
                         "score": round(score, 2),
                         "tree1": {
                             "id": self.tree1["id"],
@@ -324,5 +429,12 @@ class SmartMatching:
                             "person": person2,
                         },
                     }
+                )
 
-        return best or {}
+        matches.sort(key=lambda item: item["score"], reverse=True)
+        return {
+            "tree1Size": len(people1),
+            "tree2Size": len(people2),
+            "matchesCount": len(matches),
+            "matches": matches,
+        }
