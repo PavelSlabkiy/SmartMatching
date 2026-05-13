@@ -38,6 +38,8 @@
 
 Возвращается объект:
 
+- `tree1Id` — id первого дерева;
+- `tree2Id` — id второго дерева;
 - `tree1Size` — размер первого дерева;
 - `tree2Size` — размер второго дерева;
 - `matchesCount` — число найденных совпадений;
@@ -78,12 +80,14 @@ docker run --rm -v "$(pwd):/data" smartmatching:latest --tree1 /data/tree1.json 
 
 - В каждом запуске необходимо сохранять полный JSON-ответ алгоритма.
 - Необходимо сохранять результаты **всех** сравнений деревьев, выполненных в рамках теста.
-- Минимально фиксируемые поля ответа: `tree1Size`, `tree2Size`, `matchesCount`, `matches`.
+- Минимально фиксируемые поля ответа: `tree1Id`, `tree2Id`, `tree1Size`, `tree2Size`, `matchesCount`, `matches`.
 
 Пример структуры возвращаемого JSON:
 
 ```json
 {
+  "tree1Id": "tree_1_id",
+  "tree2Id": "tree_2_id",
   "tree1Size": 134,
   "tree2Size": 128,
   "matchesCount": 3,

@@ -391,6 +391,8 @@ class SmartMatching:
 
         :return: dict формата:
             {
+              "tree1Id": str,
+              "tree2Id": str,
               "tree1Size": int,
               "tree2Size": int,
               "matchesCount": int,
@@ -433,6 +435,8 @@ class SmartMatching:
 
         matches.sort(key=lambda item: item["score"], reverse=True)
         return {
+            "tree1Id": self.tree1["id"],
+            "tree2Id": self.tree2["id"],
             "tree1Size": len(people1),
             "tree2Size": len(people2),
             "matchesCount": len(matches),

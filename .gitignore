@@ -22,3 +22,4 @@ env/
 .cursor/
 import.json
 run_match_test.py
+logfile.txt
